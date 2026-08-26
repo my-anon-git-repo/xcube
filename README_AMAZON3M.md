@@ -1,0 +1,922 @@
+# 🌱 PLANT on Amazon-3M
+
+This is the Amazon-3M companion to [README.md](README.md). The PLANT paradigm,
+architecture, and 5-stage pipeline are all unchanged — only the dataset
+changes. Read [README.md](README.md) first for the concepts; this file only
+documents what's different when `--source_url="XURLs.AMAZON_3M"` instead of
+`XURLs.MIMIC4_DEMO`.
+
+> 💻 **Where this runs**: this document was assembled and dry-run-verified
+> (CPU-only, Stage 3's data-check) on the primary dev machine, which has no
+> GPU. Actual training (Stages 1, 3, 4, 5) is meant to run on a separate
+> cloud GPU box, synced via `scripts/publish_anon.sh` /
+> `scripts/sync_anon_branch.sh` — see `DEVELOPMENT_WORKFLOW.md`.
+
+## 📋 Table of Contents
+
+- [📊 Dataset: Amazon-3M](#-dataset-amazon-3m)
+- [📝 Naming Conventions for Amazon-3M](#-naming-conventions-for-amazon-3m)
+- [🚀 PLANT Pipeline](#-plant-pipeline)
+  - [Stage 1: SOTA LLM Fine-tuning](#stage-1-sota-llm-fine-tuning-)
+  - [Stage 2: Task-Specific Head Attachment](#stage-2-task-specific-head-attachment-)
+  - [Stage 3: L2R Pretraining with MIG](#stage-3-l2r-pretraining-with-mig-)
+  - [Stage 4: L2R Attention Transfer](#stage-4-l2r-attention-transfer-)
+  - [Stage 5: PLANT Fine-tuning](#stage-5-plant-fine-tuning-)
+- [🔧 What had to change to port this from MIMIC-IV](#-what-had-to-change-to-port-this-from-mimic-iv)
+- [⚠️ The 2.8M-label problem (read before a full-scale run)](#️-the-28m-label-problem-read-before-a-full-scale-run)
+- [🧪 Smoke-testing all 5 stages on a sample first](#-smoke-testing-all-5-stages-on-a-sample-first)
+- [📐 Precision@k / NDCG@k for Amazon-3M's label density](#-precisionk--ndcgk-for-amazon-3ms-label-density)
+
+## 📊 **Dataset: Amazon-3M**
+
+[Amazon-3M](https://xcubebucket.s3.us-east-2.amazonaws.com/Amazon-3M/amazon-3m.tar.gz)
+(`XURLs.AMAZON_3M` in `xcube/data/external.py`) is an extreme multi-label
+product classification dataset: product title + description as `text`,
+`;`-delimited related-product ids as `labels`.
+
+### 📥 Download Dataset
+
+```python
+# 🐍 Python REPL commands
+from xcube.imports import *
+p = untar_xxx(XURLs.AMAZON_3M)
+print(f"Dataset location: {p}")
+# Available files: amazon-3m.csv  (columns: text, labels, is_valid)
+```
+
+### ⚠️ One-time dataset prep: the `_full` symlink
+
+Every stage's `--data` argument is used two ways by the pipeline code:
+
+1. As a literal filename — `get_data()` in `finetune_llm.py` /
+   `multilabel_classify.py` / `learning2rank.py` reads
+   `{source}/{data}.csv` directly.
+2. As a naming-convention string — `bootl2r.py`'s Stage 3 derives the
+   prefix for all the MIG intelligence files by **stripping the trailing
+   `_full` suffix** from `--data` (`'_'.join(data.split('_')[:-1])`), the
+   same way `mimic4_icd10_full` → `mimic4_icd10`.
+
+MIMIC's raw CSV is literally named `mimic4_icd10_full.csv`, so both uses
+line up for free. Amazon's raw CSV is just `amazon-3m.csv` — no `_full`
+suffix — so we symlink one into existence once per box:
+
+```bash
+python3 - <<'PY'
+from xcube.imports import *
+p = untar_xxx(XURLs.AMAZON_3M)
+full = p / "amazon-3m_full.csv"
+if not full.exists():
+    full.symlink_to("amazon-3m.csv")
+print(f"Ready: {full}")
+PY
+```
+
+After this, `--data="amazon-3m_full"` resolves to the real CSV **and**
+Stage 3 derives the correct `amazon-3m` prefix for its output files. This
+step has already been done on the primary dev machine; **repeat it once on
+the GPU box** after `sync_anon_branch.sh` pulls the code (the dataset
+itself is downloaded separately via `untar_xxx`, it isn't part of the git
+sync).
+
+### 🔍 Optional: Tokenization Verification
+
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+python check_tokens.py \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="amazon-3m_full" \
+    --base_dir="../tmp" \
+    --output_dir="amazon-3m_tokenization" \
+    --label_delim=";"
+```
+</details>
+
+This was run on the dev machine as a smoke test of this port (CPU-only,
+~45s: it loads the full CSV but only tokenizes+checks a random 10-row
+sample) — label consistency check **passed**. Note `check_tokens.py`'s
+comparison tokenizers (`Bio_ClinicalBERT`, `PubMedBERT`, `bert-base`) are
+hardcoded and biomedical — that part of the report isn't meaningful for
+product text, but the underlying chunking/label-split logic it exercises
+is dataset-agnostic and is what actually got verified here.
+
+## 📝 **Naming Conventions for Amazon-3M**
+
+Same rules as [README.md](README.md#-naming-conventions--consistency):
+
+```
+hub_model_id: {username}/{model_name}-{dataset}-{stage}
+output_dir: {dataset}_{stage}_{model_shortname}
+```
+
+```bash
+# Setup names for Mistral-7B on Amazon-3M
+source setup_plant_names.sh "amazon-3m_full" "mistralai/Mistral-7B-Instruct-v0.3"
+```
+
+This prints (and exports) exactly:
+
+| Stage | Hub ID | Output Dir |
+| --- | --- | --- |
+| 1 | `deb101/mistral-7b-amazon-3m-adapt` | `mistral7b_amazon-3m` |
+| 2 | *(same as Stage 1)* | `amazon-3m_classify_mistral7b` |
+| 3 | `mistralai/Mistral-7B-Instruct-v0.3` (tokenizer only) | `amazon-3m_l2rboot_mistral7b` |
+| 4 | *(same as Stage 1)* | `amazon-3m_l2rtrain_mistral7b` |
+| 4 (L2R output) | `deb101/mistral-7b-amazon-3m-adapt-l2r` | — |
+| 5 | *(same as Stage 4 L2R output)* | `amazon-3m_plantclassify_mistral7b` |
+
+`DATASET_NAME="amazon-3m_full"` is exported for use as `--data` in every
+stage below. See [What had to change](#-what-had-to-change-to-port-this-from-mimic-iv)
+for why `setup_plant_names.sh` needed a one-line fix to produce this
+correctly.
+
+---
+
+## 🚀 **PLANT Pipeline**
+
+All commands below assume you've run the `setup_plant_names.sh` command
+above in the same shell (or `scripts/`, since `launches/*` are invoked
+relative to `scripts/` per README.md).
+
+### **Stage 1: SOTA LLM Fine-tuning** 🤖
+
+#### 🆕 Fresh Training
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchLLM \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE1_OUTPUT_DIR" \
+    --hub_model_id="$STAGE1_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --do_fresh_training
+```
+</details>
+
+#### ⏭️ Resume from Checkpoint
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchLLM \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE1_OUTPUT_DIR" \
+    --hub_model_id="$STAGE1_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --do_fresh_training \
+    --load_from_checkpoint
+```
+</details>
+
+#### 📊 Evaluation Only
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchLLM \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE1_OUTPUT_DIR" \
+    --hub_model_id="$STAGE1_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME"
+```
+</details>
+
+---
+
+### **Stage 2: Task-Specific Head Attachment** 🏷️
+*(Baseline Comparison Only)*
+
+#### 🆕 Fresh Training
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE2_OUTPUT_DIR" \
+    --hub_model_id="$STAGE2_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --task="multilabel-classify" \
+    --do_fresh_training \
+    --num_train_epochs=5 \
+    --per_device_train_batch_size=8 \
+    --per_device_eval_batch_size=8 \
+    --learning_rate=1e-4 \
+    --final_lr_scheduling=1e-6 \
+    --warmup_steps=500 \
+    --metric_for_best_model="precision_at_15"
+```
+</details>
+
+#### ⏭️ Resume Training
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE2_OUTPUT_DIR" \
+    --hub_model_id="$STAGE2_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --task="multilabel-classify" \
+    --do_fresh_training \
+    --num_train_epochs=7 \
+    --per_device_train_batch_size=8 \
+    --per_device_eval_batch_size=8 \
+    --learning_rate=1e-4 \
+    --final_lr_scheduling=1e-6 \
+    --warmup_steps=50 \
+    --metric_for_best_model="precision_at_15" \
+    --load_from_checkpoint
+```
+</details>
+
+#### 📊 Evaluation Only
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE2_OUTPUT_DIR" \
+    --hub_model_id="$STAGE2_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --task="multilabel-classify" \
+    --per_device_eval_batch_size=8
+```
+</details>
+
+---
+
+### **Stage 3: L2R Pretraining with MIG** 🔬
+
+#### 🧠 MIG Bootstrap Training
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launch_l2rboot \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE3_OUTPUT_DIR" \
+    --hub_model_id="$STAGE3_HUB_ID" \
+    --bs=8 \
+    --chnk_sz=200 \
+    --max_length=4096
+```
+</details>
+
+> 🔑 **Critical Note**: same as MIMIC — `--hub_model_id` specifies the
+> tokenizer model, which **must match** `--model_name` in Stage 4.
+
+> 📏 **Why `--max_length=4096` and not MIMIC's `11776`?** Stage 3 has to
+> see the **whole** document (MIG needs full-document token↔label
+> co-occurrence, unlike Stages 1/2/4/5 which truncate to 512). MIMIC-IV
+> discharge notes are very long, hence 11776. Amazon-3M's `title /SEP/
+> description` text is much shorter — measured on the actual downloaded
+> `amazon-3m.csv` with the Mistral-7B tokenizer (50K-row sample):
+>
+> | Percentile | Token count |
+> | --- | --- |
+> | p50 | 214 |
+> | p90 | 498 |
+> | p99 | 1,363 |
+> | p99.9 | 2,998 |
+> | max (sample) | 17,130 |
+>
+> 4096 covers ~99.9% of documents in full. If you want to double-check
+> coverage on the full 2.46M-row dataset before a long Stage 3 run, use
+> the verification step below and inspect chunk counts — bump
+> `--max_length` up if you see meaningful truncation.
+
+#### 📊 **Generated MIG Intelligence Files**
+
+Written to `$STAGE3_OUTPUT_DIR`, prefixed with `amazon-3m` (the
+`_full`-stripped form of `$DATASET_NAME`, exactly like `mimic4_icd10` for
+MIMIC):
+
+| Component | File | Description |
+| --- | --- | --- |
+| 🎯 **Core Data** | `amazon-3m_p_L.pkl` | Label probability distributions |
+| 🧠 **Intelligence** | `amazon-3m_tok_lbl_info.pkl` | Token-label mutual information matrix |
+| 🔤 **Mappings** | `amazon-3m_tok.ft` | Token ID to string mappings |
+| 🏷️ **Labels** | `amazon-3m_lbl.ft` | Label ID to string mappings |
+| 📈 **Rankings** | `amazon-3m_tok_rank_per_lbl.ft` | Token importance per label |
+| 📊 **Inverse Rankings** | `amazon-3m_lbl_rank_per_tok.ft` | Label relevance per token |
+
+#### 🔍 **Verify MIG Quality**
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launch_l2r_datacheck \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE3_OUTPUT_DIR"
+```
+</details>
+
+**Generated Intelligence Reports:**
+- 📋 `icd10_codes_to_tokens_*.md` / `tokens_to_icd10_codes_*.md` — the
+  report file names are hardcoded with an `icd10` fragment inside
+  `l2r_dataload.py` regardless of dataset (cosmetic only — for Amazon-3M
+  read "label" wherever it says "ICD-10 code"). Same applies to log
+  messages and class names like `MultilabelICDClassifier` in
+  `multilabel_classify.py` / `learning2rank.py` — purely cosmetic,
+  functionally dataset-agnostic.
+
+---
+
+### **Stage 4: L2R Attention Transfer** 🧠
+
+#### 🆕 Fresh Training
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launch_l2r_training \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --data_l2r_fname_prefix="amazon-3m" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --l2r_boot_dir="$STAGE3_OUTPUT_DIR" \
+    --output_dir="$STAGE4_OUTPUT_DIR" \
+    --hub_model_id="$STAGE4_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --do_fresh_training \
+    --num_train_epochs=5 \
+    --learning_rate=1e-4 \
+    --warmup_steps=0 \
+    --metric_for_best_model="ndcg@25"
+```
+</details>
+
+#### ⏭️ Resume from Checkpoint
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launch_l2r_training \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --data_l2r_fname_prefix="amazon-3m" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --l2r_boot_dir="$STAGE3_OUTPUT_DIR" \
+    --output_dir="$STAGE4_OUTPUT_DIR" \
+    --hub_model_id="$STAGE4_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME" \
+    --do_fresh_training \
+    --num_train_epochs=2 \
+    --learning_rate=1e-4 \
+    --warmup_steps=0 \
+    --metric_for_best_model="ndcg@25" \
+    --load_from_checkpoint
+```
+</details>
+
+#### 📊 Evaluation Only
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launch_l2r_training \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --data_l2r_fname_prefix="amazon-3m" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --l2r_boot_dir="$STAGE3_OUTPUT_DIR" \
+    --output_dir="$STAGE4_OUTPUT_DIR" \
+    --hub_model_id="$STAGE4_HUB_ID" \
+    --model_name="$BASE_MODEL_NAME"
+```
+</details>
+
+> 📊 **Detailed Reports**: add `--generate_report` for
+> `tokenrank_report_*.md` / `.json`.
+
+> 🎯 **Critical Output**: the trained L2R model is saved as
+> `$STAGE4_HUB_ID_L2R` (`deb101/mistral-7b-amazon-3m-adapt-l2r`) — this
+> becomes the input for Stage 5.
+
+---
+
+### **Stage 5: PLANT Fine-tuning** 🌱
+
+#### 🆕 Fresh Training
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE5_OUTPUT_DIR" \
+    --hub_model_id="$STAGE5_HUB_ID" \
+    --task="multilabel-plantclassify" \
+    --do_fresh_training \
+    --num_train_epochs=5 \
+    --per_device_train_batch_size=8 \
+    --per_device_eval_batch_size=8 \
+    --learning_rate=1e-4 \
+    --final_lr_scheduling=1e-6 \
+    --warmup_steps=50 \
+    --metric_for_best_model="precision_at_15"
+```
+</details>
+
+#### ⏭️ Resume from Checkpoint
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE5_OUTPUT_DIR" \
+    --hub_model_id="$STAGE5_HUB_ID" \
+    --task="multilabel-plantclassify" \
+    --do_fresh_training \
+    --num_train_epochs=7 \
+    --per_device_train_batch_size=8 \
+    --per_device_eval_batch_size=8 \
+    --learning_rate=1e-4 \
+    --final_lr_scheduling=1e-6 \
+    --warmup_steps=50 \
+    --metric_for_best_model="precision_at_15" \
+    --load_from_checkpoint
+```
+</details>
+
+#### 📊 Evaluation Only
+<details>
+  <summary>💻 <strong>Click to expand command</strong></summary>
+
+```bash
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" \
+    --data="$DATASET_NAME" \
+    --max_length=512 \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$STAGE5_OUTPUT_DIR" \
+    --hub_model_id="$STAGE5_HUB_ID" \
+    --task="multilabel-plantclassify" \
+    --per_device_eval_batch_size=8
+```
+</details>
+
+### 🔄 Stage Flow Summary
+
+Identical to MIMIC-IV — see
+[README.md](README.md#-stage-flow-summary).
+
+---
+
+## 🔧 **What had to change to port this from MIMIC-IV**
+
+1. **`scripts/setup_plant_names.sh` — fixed a latent naming bug.**
+   `DATASET_SHORT` was computed as `cut -d'_' -f1-2`, which assumes the
+   dataset string always has ≥3 underscore-separated fields (true for
+   `mimic4_icd10_full`, false for `amazon-3m_full` — only 2 fields, so the
+   old logic returned the whole string, `_full` suffix included). Replaced
+   with `${DATASET%_*}` (strip the trailing underscore segment), which
+   matches exactly how `bootl2r.py` derives its own file-naming prefix and
+   gives the correct result for both patterns. Verified no change in
+   output for the existing MIMIC-IV naming (regression-checked). This
+   also silently fixes `scripts/launches/launchl2rboot_amazon670k`'s
+   `amazon-670k_full` case, which hit the identical bug.
+2. **One-time symlink** `amazon-3m_full.csv → amazon-3m.csv` in the
+   downloaded data directory, so `--data="amazon-3m_full"` satisfies both
+   of `get_data()`'s literal-filename lookup and `bootl2r.py`'s
+   suffix-stripped prefix derivation. See
+   [above](#️-one-time-dataset-prep-the-_full-symlink).
+3. Everything else — `finetune_llm.py`, `multilabel_classify.py`,
+   `bootl2r.py`, `learning2rank.py`, `check_tokens.py`, all `launches/*`
+   scripts — is dataset-agnostic by construction (parametrized entirely
+   through `--source_url` / `--data` / `--label_delim`, defaulting to `;`
+   which is also Amazon-3M's label delimiter). No code changes were
+   needed there; only the command-line values above differ from the
+   MIMIC-IV invocations in README.md.
+4. Verified with a real (not mocked) CPU-only run of the Stage 3
+   tokenization/label-consistency check against the actual downloaded
+   `amazon-3m.csv` — passed. Heavier stages (1, 3 full run, 4, 5) need the
+   GPU box and weren't run here.
+5. Extended `scripts/finetune_llm.py` and `scripts/learning2rank.py` with
+   `--num_train_epochs` / `--per_device_train_batch_size` /
+   `--per_device_eval_batch_size` / `--gradient_accumulation_steps` CLI
+   overrides. They were hardcoded (`epochs=3, batch=1, grad_accum=4`)
+   while `scripts/multilabel_classify.py` already exposed them — a plain
+   inconsistency, now fixed the same way in all three, defaults unchanged
+   (so existing MIMIC invocations behave identically).
+6. Added `--skip_push_to_hub` to all three training scripts (default
+   `False`, no behavior change unless passed) — see
+   [the smoke-test section](#-smoke-testing-all-5-stages-on-a-sample-first)
+   for why.
+7. Added `precision_at_25` / `recall_at_25` (+ `rare_`/`not_rare_`
+   variants) as additional `--metric_for_best_model` choices in
+   `multilabel_classify.py` — see
+   [Precision@k for Amazon-3M](#-precisionk--ndcgk-for-amazon-3ms-label-density).
+8. Fixed `--skip_push_to_hub` to also short-circuit each script's
+   post-training "reload the model" step (it previously still tried to
+   fetch `--hub_model_id` from the Hub whenever `--do_fresh_training` was
+   set, regardless of whether the push happened — 404s the moment a push
+   is skipped). Same fix, same reasoning, in all four affected call sites
+   across the three training scripts.
+9. Fixed a crash in `multilabel_classify.py`'s `compute_metrics_with_labels()`:
+   the rare/not-rare label split uses a hardcoded `rare_threshold=50`
+   (labels appearing in fewer than 50 training docs are "rare"). On a
+   small sample, one whole partition can end up empty (0 columns), and
+   sklearn's `f1_score`/`precision_recall_fscore_support` raise
+   `ValueError: unknown is not supported` on a 0-column target instead of
+   returning a sane default. Guarded all four rare/not-rare metric blocks
+   to skip cleanly (default `0.0`) when a partition is empty, and made
+   `rare_threshold` a `--rare_threshold` CLI arg (default `50`, unchanged)
+   so sample runs can lower it to actually exercise both partitions
+   instead of just avoiding the crash — `--rare_threshold=5` splits the
+   600-row sample's 95 labels into 64 rare / 31 not-rare, both non-empty.
+10. `multilabel_classify.py`'s `main()` calls an internal
+    `sample_df_with_full_label_coverage(df, frac=0.001, ...)` *before*
+    `preprocess_data()` runs, at a hardcoded `frac=0.001` call site
+    (`multilabel_classify.py:4011`) — it first draws that fraction of the
+    data, then greedily adds rows one at a time until every unique label
+    is covered at least once. `0.001` is sized for MIMIC-IV's ~270K-row
+    full dataset (≈270 rows); on the 600-row sample it rounds to ~0, so
+    the greedy top-up alone decides the final size — observed shrinking
+    Stage 2's actual training set to 39 rows (down from the intended 540)
+    on a real run, which also explained why the rare/not-rare split
+    looked different than expected and why eval metrics were noisy (3-row
+    eval set). Made `frac` a `--label_coverage_frac` CLI arg (default
+    `0.001`, unchanged); pass `--label_coverage_frac=1.0` to make it use
+    the full split as-is (a `frac=1.0` draw already covers every label by
+    construction, so the greedy top-up never triggers). Also worth
+    flagging for the full-scale run: this same greedy loop, run against
+    the real 2.8M-label corpus, could need to keep adding rows until it's
+    touched a large fraction of the whole 2.46M-row dataset — another
+    consequence of the label cardinality above, not a separate bug.
+11. Removed a leftover dev-iteration block in `learning2rank.py`'s `main()`
+    (Stage 4) that subsampled `df_data` to `frac = 0.001 * 0.3` (0.03%) of
+    rows before every training run, marked by the original author's own
+    `# quick iteration <remove later>` comments. On Amazon-3M's full
+    dataset this silently trained on a few thousand rows instead of the
+    full corpus; on the 600-row sample both the `is_valid`/`~is_valid`
+    `.sample(frac=...)` calls rounded down to 0 rows, producing a fully
+    empty `df_data`, which `preprocess_data()` turned into a zero-column
+    HF `Dataset` and crashed with `Columns [...] not in the dataset`.
+    Deleted the block entirely — Stage 4 now trains on the full
+    `df_data` it's given, for both the sample and real MIMIC-IV runs.
+12. Fixed a numerically-unstable training loss in Stage 4's `LTRModel`
+    (`xcube/l2r/models/core.py`): `approxNDCG_loss` was called with
+    `label_type=LABEL_TYPE.MultiLabel`, whose gain formula is `2^rel - 1`
+    — sane for a handful of LETOR-style relevance grades (0-4), but the
+    ground-truth relevance here comes from `quantize_l2r_data`'s 101
+    quantile bins (grades 0-101), so `2^100 ≈ 2.5e30`. That single call
+    produced training losses like `-8.4e15` and frequent `grad_norm: nan`
+    on a real Stage 4 run — not a sample-only artifact, since 101
+    quantization levels are hardcoded regardless of dataset size. Eval
+    metrics looked fine because they're computed separately via
+    `torchmetrics.retrieval_normalized_dcg`, which doesn't use this gain
+    formula. Switched to `label_type=LABEL_TYPE.Permutation`, which uses
+    linear gains (`batch_stds` as-is) — the mode `ptranking` itself
+    provides for fine-grained/many-level relevance signals like this one,
+    and numerically stable across the full 0-101 grade range.
+13. Fixed Stage 5 failing to load Stage 4's local checkpoint as its base
+    model (`../tmp_sample/.../amazon-3m-sample_l2rtrain_mistral7b` passed
+    as `--hub_model_id`): `LTRModel.from_pretrained()`
+    (`xcube/l2r/models/core.py`) unconditionally called `hf_hub_download`
+    for `model.safetensors`, `pytorch_model.bin`, *and* `lookup_table.pt`
+    — `hf_hub_download` requires a `namespace/repo_name` Hub id and raises
+    `HFValidationError` on a local path, so all three lookups failed with
+    `Repo id must be in the form 'repo_name' or 'namespace/repo_name'`.
+    This is exactly the local-vs-Hub check `load_custom_task_model_and_tokenizer()`
+    in `multilabel_classify.py` already does correctly — `LTRModel` (the
+    Stage 4 output's model class) never got the same guard. Added an
+    `os.path.isdir(...)` check before each of the three downloads,
+    loading directly from disk when given a local directory and falling
+    back to `hf_hub_download` only for genuine Hub ids.
+    `xcube/l2r/models/core.py` is nbdev-generated
+    (`nbs/07_l2r.models.core.ipynb`); this fix and item 12's were both
+    made in the source notebook and re-exported via `nbdev_export`, so
+    they survive the next notebook-driven rebuild instead of being
+    silently clobbered.
+
+## ⚠️ **The 2.8M-label problem (read before a full-scale run)**
+
+Before building a sample, it's worth knowing what "extreme" means for this
+particular dataset, because it changes how you should scope any run —
+sample or full.
+
+Measured directly on the downloaded `amazon-3m.csv` (2,460,406 rows):
+
+| Quantity | Value |
+| --- | --- |
+| Total unique labels across the whole corpus | **2,812,281** |
+| Labels appearing in ≥ 50 docs ("not rare" per the repo's threshold) | 400,974 |
+| Labels appearing in ≥ 100 docs | 180,771 |
+| Coverage of all label-instances by the top 50,000 most frequent labels | 27.1% |
+| Median labels per document | 24 (capped at 100) |
+
+Two consequences for this codebase specifically:
+
+1. **`multilabel_classify.py`'s `preprocess_data()` calls
+   `MultiLabelBinarizer().fit_transform(labels)` with no `classes=`
+   restriction and no `sparse_output=True`.** Run that against the full
+   CSV as-is and it tries to materialize a **dense** `(2.46M × 2.81M)`
+   boolean array — many terabytes — before any GPU code even runs. It
+   will not get that far in practice; it'll exhaust memory first.
+2. **The custom classifier head (`MultilabelICDClassifier` /
+   `MultilabelICDPlantClassifier`) allocates
+   `nn.Parameter(torch.randn(num_labels, hidden_size))`** — i.e. one
+   learned embedding per label. At `num_labels ≈ 2.8M` and
+   `hidden_size=4096` (Mistral-7B), that's ~11.5B parameters for label
+   embeddings alone, before the backbone.
+
+This is architecturally different from MIMIC-IV, whose ~8–17K ICD codes
+are small enough for both of the above to just work. Amazon-3M's label
+space, as delivered, is not — this isn't a bug to port around, it's the
+actual "extreme" in extreme multi-label classification, and this
+particular classifier design (dense per-label embeddings + a plain
+`fit_transform`) assumes a bounded label vocabulary.
+
+**This needs a decision from you before a full-scale run**, not just a
+sample: some form of label filtering (e.g. keep only the top-N most
+frequent labels and drop the rest from each document's label list,
+dropping documents left with none) is necessary for Stage 2/4/5 to even
+initialize, let alone train. How aggressively to filter — and whether
+that changes the task in a way that still matches what you want to show —
+is a modeling decision, not something I picked unilaterally. The sample
+below applies a simple top-150 filter purely to prove the *code paths*
+work; it is not a proposal for the full-scale label vocabulary.
+
+## 🧪 **Smoke-testing all 5 stages on a sample first**
+
+### Why, and what a "sample" has to satisfy here
+
+Given the above, a sample for this pipeline isn't just "fewer rows" — it
+has to bound **three** things at once, because they each drive a
+different cost/failure mode:
+
+1. **Row count** — drives per-step training time (Stages 1, 2, 4, 5).
+2. **Unique label count** — drives the classifier head size (Stages 2, 4,
+   5) *and* the number of full-dataset passes Stage 3's MIG bootstrap
+   makes (`ceil(num_unique_labels / chnk_sz)`, `chnk_sz=200` by default —
+   stay under 200 total labels and Stage 3 does a single pass).
+3. **A hidden cross-stage dependency**: `bootl2r.py`'s Stage 3
+   (`get_info()` → `load_mlb_classes()`) reads
+   `{base_dir}/labels_partition.json`, which is only ever *written* by
+   `multilabel_classify.py`'s `preprocess_data()` — i.e. by Stage 2 (or
+   5). This isn't mentioned in README.md's pipeline diagram at all,
+   but it's a hard runtime dependency: **Stage 3 cannot run before Stage
+   2 has run at least once against the same `--base_dir`.** Running the
+   stages in numeric order (1→2→3→4→5) satisfies it for free.
+
+### Building the sample
+
+Use `scripts/create_amazon3m_sample.py` — committed alongside the rest of
+the pipeline (not a scratch one-off), so it travels with
+`sync_anon_branch.sh` and reproduces the same sample deterministically
+(fixed `--seed`, default 42) on any box:
+
+```bash
+cd ~/xcube/scripts
+python3 create_amazon3m_sample.py
+# defaults: --source_url=XURLs.AMAZON_3M --csv_name=amazon-3m
+#           --output_name=amazon-3m-sample_full --top_k_labels=150
+#           --target_rows=600 --valid_frac=0.10 --seed=42
+```
+
+It does exactly this:
+1. Counts global label frequency across the full `amazon-3m.csv` (one pass).
+2. Keeps the top `--top_k_labels` (150) most frequent labels — comfortably
+   under `chnk_sz=200`, so Stage 3 does exactly one label-chunk pass.
+3. Scans the CSV, filters each doc's label list down to that top-150 set,
+   drops docs left with zero labels, collects a pool of qualifying rows
+   (`--pool_multiplier × --target_rows`), then randomly samples
+   `--target_rows` (600) of them.
+4. Re-derives `is_valid` as a clean split (`--valid_frac`, default 90/10 →
+   540 train / 60 eval) rather than trusting the original column, since
+   heavy label-filtering can skew it.
+
+It downloads/locates the source dataset itself via `untar_xxx(XURLs.AMAZON_3M)`
+and writes the sample into that same directory
+(`~/.xcube/data/amazon-3m/amazon-3m-sample_full.csv` — same `_full`
+naming convention as the full dataset; see the symlink section above), so
+there's nothing to configure path-wise on a fresh box beyond having run
+the dataset download step.
+
+Result:
+
+| | Full dataset | Sample |
+| --- | --- | --- |
+| Rows | 2,460,406 | 600 (540 train / 60 eval) |
+| Unique labels | 2,812,281 | 95 |
+| Median labels/doc | 24 | 1 |
+| File | `amazon-3m.csv` | `amazon-3m-sample_full.csv` |
+
+The median-labels/doc collapsing from 24 to 1 is expected and fine for a
+*smoke test*: filtering to only the head-150 labels naturally leaves most
+sampled docs with just one surviving label, since Amazon-3M's labels are
+mostly near-unique "related product" ids with little overlap outside a
+small frequent core. This sample proves the pipeline *runs* on real data
+shaped correctly; it says nothing about model quality.
+
+### Isolating sample runs from the real run
+
+All sample commands below use **`--base_dir="../tmp_sample"`** instead of
+`../tmp`. Since every stage derives its actual working directory as
+`{base_dir}/{source_url's-second-segment}` (i.e. `.../AMAZON_3M/...`),
+this keeps every artifact the sample touches — including the shared
+`labels_partition.json` — in a completely separate tree from a real
+`../tmp/AMAZON_3M/...` run. Nothing here can collide with or get
+overwritten by the real run later.
+
+### Avoiding Hub pollution and slow uploads
+
+`push_to_hub=True` was hardcoded in all three training scripts'
+`TrainingArguments`. For `multilabel_classify.py` specifically, the
+active save path (`trainer.save_model()` on a plain `nn.Module`, since
+`MultilabelICDClassifier` doesn't subclass `PreTrainedModel`) serializes
+the **full** state dict — frozen 7B backbone included — before a
+(correctly) size-filtered copy is written separately for the
+already-dead `save_and_push_old` path. In other words: a real push here
+uploads a multi-GB checkpoint, which could dominate the time budget on
+its own regardless of sample size. `--skip_push_to_hub` (new flag, all
+three scripts, default `False` so nothing changes unless you pass it) is
+the fix — set it for every sample-run command below. Stage 1's own model
+*is* just a small LoRA adapter (cheap to push either way), but the flag
+is there for consistency.
+
+### Chaining stages locally without the Hub
+
+Stage 5 has no `--model_name` fallback — its `--hub_model_id` **must**
+resolve to Stage 4's actual L2R output (that's the whole point of
+attention transfer), and Stage 4/2 similarly want Stage 1's adapted
+checkpoint as their backbone. Since `--skip_push_to_hub` means nothing
+reaches the Hub, point `--hub_model_id` at the **local output directory**
+of the previous stage instead of a Hub id string — `from_pretrained()` /
+`PeftConfig.from_pretrained()` accept local paths natively, and nothing
+in these particular load functions makes a Hub-only API call that would
+reject one (verified by reading `load_base_model_and_tokenizer()` — it's
+pure `from_pretrained()` calls throughout).
+
+### The commands
+
+```bash
+cd ~/xcube/scripts
+source setup_plant_names.sh "amazon-3m-sample_full" "mistralai/Mistral-7B-Instruct-v0.3" "../tmp_sample"
+# -> DATASET_NAME=amazon-3m-sample_full, BASE_DIR=../tmp_sample
+# -> STAGE1_HUB_ID=deb101/mistral-7b-amazon-3m-sample-adapt, STAGE1_OUTPUT_DIR=mistral7b_amazon-3m-sample
+# -> STAGE2_OUTPUT_DIR=amazon-3m-sample_classify_mistral7b
+# -> STAGE3_OUTPUT_DIR=amazon-3m-sample_l2rboot_mistral7b
+# -> STAGE4_OUTPUT_DIR=amazon-3m-sample_l2rtrain_mistral7b, STAGE4_HUB_ID_L2R=deb101/mistral-7b-amazon-3m-sample-adapt-l2r
+# -> STAGE5_OUTPUT_DIR=amazon-3m-sample_plantclassify_mistral7b
+
+STAGE1_LOCAL="$BASE_DIR/AMAZON_3M/$STAGE1_OUTPUT_DIR"
+STAGE4_LOCAL="$BASE_DIR/AMAZON_3M/$STAGE4_OUTPUT_DIR"
+
+# --- Stage 1 -------------------------------------------------------------
+launches/launchLLM \
+    --source_url="XURLs.AMAZON_3M" --data="$DATASET_NAME" --max_length=512 \
+    --base_dir="$BASE_DIR" --output_dir="$STAGE1_OUTPUT_DIR" \
+    --hub_model_id="$STAGE1_HUB_ID" --model_name="$BASE_MODEL_NAME" \
+    --do_fresh_training --num_train_epochs=1 \
+    --per_device_train_batch_size=8 --per_device_eval_batch_size=8 \
+    --gradient_accumulation_steps=1 --skip_push_to_hub
+
+# --- Stage 2 (also writes labels_partition.json, needed by Stage 3) ------
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" --data="$DATASET_NAME" --max_length=512 \
+    --base_dir="$BASE_DIR" --output_dir="$STAGE2_OUTPUT_DIR" \
+    --hub_model_id="$STAGE1_LOCAL" --model_name="$BASE_MODEL_NAME" \
+    --task="multilabel-classify" --do_fresh_training \
+    --num_train_epochs=1 --per_device_train_batch_size=8 --per_device_eval_batch_size=8 \
+    --learning_rate=1e-4 --final_lr_scheduling=1e-6 --warmup_steps=5 \
+    --metric_for_best_model="precision_at_25" --rare_threshold=5 \
+    --label_coverage_frac=1.0 --skip_push_to_hub
+
+# --- Stage 3 (needs labels_partition.json from Stage 2 above) ------------
+launches/launch_l2rboot \
+    --source_url="XURLs.AMAZON_3M" --data="$DATASET_NAME" \
+    --base_dir="$BASE_DIR" --output_dir="$STAGE3_OUTPUT_DIR" \
+    --hub_model_id="$STAGE3_HUB_ID" --bs=8 --chnk_sz=200 --max_length=1024
+
+# --- Stage 4 ---------------------------------------------------------------
+launches/launch_l2r_training \
+    --source_url="XURLs.AMAZON_3M" --data="$DATASET_NAME" \
+    --data_l2r_fname_prefix="amazon-3m-sample" --max_length=512 \
+    --base_dir="$BASE_DIR" --l2r_boot_dir="$STAGE3_OUTPUT_DIR" \
+    --output_dir="$STAGE4_OUTPUT_DIR" \
+    --hub_model_id="$STAGE1_LOCAL" --model_name="$BASE_MODEL_NAME" \
+    --do_fresh_training --num_train_epochs=1 --learning_rate=1e-4 --warmup_steps=0 \
+    --metric_for_best_model="ndcg@25" \
+    --per_device_train_batch_size=8 --per_device_eval_batch_size=8 \
+    --gradient_accumulation_steps=1 --skip_push_to_hub
+
+# --- Stage 5 (hub_model_id = Stage 4's local L2R output) ------------------
+launches/launchmultilabelclas \
+    --source_url="XURLs.AMAZON_3M" --data="$DATASET_NAME" --max_length=512 \
+    --base_dir="$BASE_DIR" --output_dir="$STAGE5_OUTPUT_DIR" \
+    --hub_model_id="$STAGE4_LOCAL" \
+    --task="multilabel-plantclassify" --do_fresh_training \
+    --num_train_epochs=1 --per_device_train_batch_size=8 --per_device_eval_batch_size=8 \
+    --learning_rate=1e-4 --final_lr_scheduling=1e-6 --warmup_steps=5 \
+    --metric_for_best_model="precision_at_25" --rare_threshold=5 \
+    --label_coverage_frac=1.0 --skip_push_to_hub
+```
+
+### Time budget on an H100 80GB SXM5
+
+Not executed end-to-end here (no GPU on this dev machine) — this is a
+reasoned estimate to sanity-check against, not a measurement:
+
+| Stage | Steps (540 train / batch 8, 1 epoch) | Est. wall time |
+| --- | --- | --- |
+| 1 (LoRA finetune) | ~68 | 1–3 min |
+| 2 (frozen backbone + small head) | ~68 | 1–3 min |
+| 3 (MIG bootstrap, 95 labels ⇒ 1 chunk pass) | n/a (batched stats, not SGD) | <2 min |
+| 4 (L2R ranking head) | ~68 | 1–3 min |
+| 5 (PLANT head, loads Stage 4 locally) | ~68 | 1–3 min |
+| **Total compute** | | **~5–14 min** |
+
+Plus fixed per-process overhead (Python/library imports, tokenizer/model
+load from local cache) of roughly 20–60s × 5 stages ≈ 2–5 min. That
+leaves comfortable headroom under 30 minutes — **provided
+`mistralai/Mistral-7B-Instruct-v0.3` is already cached** on the GPU box.
+The first-ever download of it (~15GB) is a one-time, bandwidth-dependent
+cost that is *not* part of the pipeline's own budget; pre-warm it before
+timing the run:
+
+```bash
+python3 -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
+AutoModelForCausalLM.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3'); \
+AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3')"
+```
+
+If Stage 2 or 5 still looks like it's uploading multiple GB despite
+`--skip_push_to_hub` (it shouldn't — that flag sets
+`training_args.push_to_hub=False`, which every push code path in these
+scripts checks before touching the network), Ctrl-C is safe once the logs
+show training + evaluation completed: that's the part this smoke test
+exists to verify, and this sample run is entirely disposable.
+
+## 📐 **Precision@k / NDCG@k for Amazon-3M's label density**
+
+Your instinct that label density should inform the choice of k was
+right, but it plays out differently for the two `--metric_for_best_model`
+mechanisms in this codebase, because they measure different things:
+
+- **`multilabel_classify.py` (Stages 2 & 5) — `precision_at_k` /
+  `recall_at_k`**: this really is "top-k predicted labels vs. this
+  document's true labels," so it directly depends on labels-per-document.
+  The code only supported fixed `k ∈ {5, 8, 15}` (hardcoded in
+  `train_model()`'s `k_values` default and the `--metric_for_best_model`
+  `choices=[...]` list) — chosen, presumably, to match MIMIC-IV's ICD
+  coding density. Measured directly on the full `amazon-3m.csv`: **median
+  24 labels/doc**, capped at 100 — meaningfully higher than MIMIC's
+  typical range and higher than any available k. I added `k=25` (matching
+  the median almost exactly, and matching Stage 4's `ndcg@25` for a
+  consistent k across the pipeline) as `precision_at_25` / `recall_at_25`
+  (+ `rare_`/`not_rare_` variants) — additive, so existing MIMIC-IV
+  invocations using `precision_at_15` etc. are unaffected. **Recommendation:
+  use `--metric_for_best_model="precision_at_25"` for Amazon-3M's Stage 2
+  and Stage 5**, in place of the MIMIC-tuned `precision_at_15` shown
+  earlier in this doc.
+- **`learning2rank.py` (Stage 4) — `ndcg@25` / `precision@25`**: despite
+  the similar name, this is a *different* metric measuring token-ranking
+  quality within one label (are the MIG-important tokens ranked near the
+  top of the document, for documents of length up to `--max_length`) —
+  it's governed by document length, not labels-per-document. Its `k=25`
+  was already fine and needs no change for Amazon-3M; I left
+  `learning2rank.py`'s metric set untouched.
+
+One caveat: the median-24 figure is real for the **full** dataset; the
+95-label smoke-test sample above collapses to ~1 label/doc by
+construction (see above), so don't read anything into its metric values
+— they're only there to prove the code runs, not to validate `k=25`.

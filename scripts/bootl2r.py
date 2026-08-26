@@ -1,0 +1,1056 @@
+# =============================================================================
+# Imports
+# =============================================================================
+from fastai.distributed import *
+from fastprogress import fastprogress
+from fastai.data.core import *
+from xcube.l2r.all import *
+from transformers import AutoTokenizer
+from huggingface_hub import login, HfApi
+from fastcore.foundation import L
+torch.serialization.add_safe_globals([L])
+from tqdm import tqdm
+
+# extra imports <remove later>
+import warnings; warnings.filterwarnings(action='ignore')
+# end extra imports
+
+# =============================================================================
+# Constants
+# =============================================================================
+torch.backends.cudnn.benchmark = True
+fastprogress.MAX_COLS = 80
+# Initialize generated_files list with tuples of (file_path, description)
+generated_files = []
+
+# =============================================================================
+# Warnings and Configuration
+# =============================================================================
+warnings.filterwarnings(action='ignore')
+torch.backends.cudnn.benchmark = True
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Script for processing MIMIC4 data")
+    
+    # Define arguments with defaults and help text
+    parser.add_argument(
+        "--source_url",
+        type=str,
+        default="XURLs.MIMIC4_L2R",
+        help="Source url (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="mimic4_icd10_full",
+        help="Filename of the raw data (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--label_delim",
+        type=str,
+        default=";",
+        help="Delimiter separating labels (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default="..",
+        help="Root dir for saving models (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of workers (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--bs",
+        type=int,
+        default=16,
+        help="Batch size (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--chnk_sz",
+        type=int,
+        default=200,
+        help="Chunk size (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="Output path for the finetuned LLM model."
+    )
+    parser.add_argument(
+        "--logfile",
+        type=str,
+        default="l2rboot",
+        help="Filename to write logs to"
+    )
+    parser.add_argument(
+        "--base_dir",
+        type=str,
+        default=None,
+        help="Path to the base directory that will contain intermediate results and models."
+    )
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default="your_username/mistral-7b-medical-lora",
+        help="Hugging Face hub model id (replace with your username/model name)"
+    )
+    parser.add_argument(
+    "--max_length",
+    type=int,
+    default=512,
+    help="Maximum sequence length. Adjust as needed (e.g., 1024 if your summaries are longer and 48GB VRAM allows)."
+    )
+
+    return parser.parse_args()
+
+
+def print_args(**kwargs):
+    """
+    Logs and prints the provided keyword arguments in a formatted manner.
+    
+    Args:
+        **kwargs: Arbitrary keyword arguments representing command-line parameters.
+    """
+    # Create a formatted string of key-value pairs.
+    formatted_args = "\n".join(f"{key}: {value}" for key, value in kwargs.items())
+    
+    # Log and print the formatted arguments.
+    logging.info("Command-line Arguments:")
+    logging.info("\n" + formatted_args)
+
+
+# Configure logging
+def setup_logging(**kwargs):
+    """
+    Configure logging for the application.
+
+    Sets up both console and file logging based on the quiet flag in args.
+    Logs include detailed information such as function name, line number,
+    and timestamp. Log files are saved in a 'logs' directory within base_dir
+    with a timestamp in their filename.
+    """
+
+    # Access the 'base_dir' and 'logfile' arguments from kwargs.
+    quiet = kwargs.get('quiet')
+    logfile = kwargs.get('logfile')
+    base_dir = kwargs.get('base_dir')
+
+    # Configure the root logger based on the quiet flag
+    if quiet:
+        logging.basicConfig(level=logging.CRITICAL)  # Suppresses all logging below CRITICAL
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d:%(funcName)s]'
+        )
+
+    # Set up file logging globally
+    log_base_dir = Path(base_dir) / 'logs'
+    log_base_dir.mkdir(exist_ok=True, parents=True)
+
+    # Format the current date and time for the filename
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = (
+        f'{logfile}_{current_time}.log'
+        if logfile
+        else f'default_logfile_{current_time}.log'
+    )
+    log_filepath = log_base_dir / log_filename
+
+    # Create file handler
+    file_handler = logging.FileHandler(log_filepath)
+    file_handler.setLevel(logging.INFO)  # Set logging level for the file handler
+
+    # Create formatter and add it to the file handler
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d:%(funcName)s]'
+    )
+    file_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(file_handler)
+
+    # Optionally, configure a specific third-party logger (e.g., 'bertopic')
+    # third_party_logger = logging.getLogger('bertopic')
+    # third_party_logger.setLevel(logging.DEBUG)  # Capture all messages from this library
+    # third_party_logger.addHandler(file_handler)
+    # Uncomment the following line if you wish to prevent propagation to the root logger:
+    # third_party_logger.propagate = False
+    return log_filepath
+
+
+def get_info(source, 
+             data, 
+             hub_model_id,
+             base_dir,
+             hf_token,
+             bs=8, 
+             chnk_sz=200, 
+             workers=None,
+             ):
+    workers = ifnone(workers, min(8, num_cpus()))
+    data = join_path_file(data, source, ext='.csv')
+    df = pd.read_csv(data,
+                 header=0,
+                 usecols=['text', 'labels'],
+                 dtype={'text': str, 'labels': str})
+    df[['text', 'labels']] = df[['text', 'labels']].astype(str)
+    logging.info(f"The size of the original dataframe is {len(df)}")
+
+    # # sampling for quick iterations: remove later 
+    # bs = 8
+    # cut = len(df) - len(df)%bs
+    # df = df[:cut]
+    # len(df)
+
+    # _arr = np.arange(0, len(df), bs)
+    # # mask = (_arr > 4000) & (_arr < 5000)
+    # mask = (_arr > 500) & (_arr < 1000)
+    # _n = np.random.choice(_arr[mask], 1)
+    # df = df.sample(n=_n, random_state=89, ignore_index=True)
+    # logging.info(f"For quick iteration sampled a dataframe of size {len(df)}")
+    # # sampling for quick iterations: remove later 
+
+    # Duplicate the last row # this is a hack <fix later>
+    last_rows = df.iloc[-14:]  # Get the last row as a DataFrame
+    df = pd.concat([df, last_rows], ignore_index=True)
+    # this is a hack <fix later>
+
+    logging.info(f"Loading the Tokenizer from {hub_model_id}")
+    api = HfApi()
+    repo_info = api.repo_info(repo_id=hub_model_id, token=hf_token)
+    last_modified = repo_info.last_modified  # This is a datetime object
+    if last_modified:
+        last_modified_str = last_modified.strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"Model {hub_model_id} was last saved on: {last_modified_str}")
+    tokenizer = AutoTokenizer.from_pretrained(hub_model_id, token=hf_token)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    mlb_classes = load_mlb_classes(mlb_dir=base_dir)
+    if mlb_classes: logging.info(f"Loading of mlb classes from {base_dir} was successfull!")
+
+    logging.info(f"Reading the data from {source/data} into dataframe!")
+    logging.info(f"The length of the dataframe is {len(df)}, an example text (first 500 words) is \n -----\n{df.iloc[0].text[:500]} \n------\n and the corresponding labels are \n------\n {df.iloc[0].labels}\n---\n")
+    info = MutualInfoGain(df, tokenizer, mlb_classes, bs=bs, chnk_sz=chnk_sz, lbs_desc=None) # provide lbs_desc if you have it
+    return info
+
+
+def test_nanegs(**kwargs):
+    for k, v in kwargs.items():
+        has_nans = v.isnan().all() # check for nans
+        has_negs = not torch.where(v>=0, True, False).all()
+        # if has_nans: raise Exception(f"{namestr(o, locals())[0]} has nans")
+        # if has_negs: raise Exception(f"{namestr(o, locals())[0]} has negs")
+        if has_nans: raise Exception(f"{k} has nans")
+        if has_negs: raise Exception(f"{k} has negs")
+
+
+def stat_transform_old(mut_infos, save_dir, fname):
+    logging.info(f"{mut_infos.shape=}")
+    orig_shape = mut_infos.shape
+    mut_infos = mut_infos.cpu().numpy().reshape(-1)
+    logging.info(f"{mut_infos.min()=}, {mut_infos.max()=}, {mut_infos.mean()=}")
+    logging.info(f"{skew(mut_infos)=}")
+    logging.info("The mutual-info values are incredibly skewed. So we need to apply some transformation. Sometimes `mut_infos` might contain negs, we need to convert those to eps.")
+    # np.where(mut_infos<0, 1, 0).sum() # or, better yet
+    where_negs = mut_infos < 0
+    logging.info(f"{np.sum(where_negs)=}")
+    logging.info("Converting the negs into eps..")
+    eps = np.float32(1e-20)
+    mut_infos[where_negs] = eps
+    test_eq(np.sum(mut_infos<0), 0)
+    logging.info(f"{ np.min(mut_infos) = }, { np.max(mut_infos) = }, { np.mean(mut_infos) = }");
+    hist, bins, _ = plt.hist(mut_infos, bins=50)
+    f = join_path_file(fname+'_mut_infos_hist', save_dir, ext='.png'); plt.savefig(f); generated_files.append(f)
+    logging.info("Applying box-cox transformation...")
+    bcx_mut_infos, *_ = boxcox(mut_infos+eps)
+    logging.info(f"{np.min(bcx_mut_infos) = }, {np.max(bcx_mut_infos)=}, {np.mean(bcx_mut_infos) = }, {np.median(bcx_mut_infos) = }")
+    logging.info(f"{np.isnan(bcx_mut_infos).sum() = }, {np.isinf(bcx_mut_infos).sum() = }, {np.isneginf(bcx_mut_infos).sum() = }")
+    logging.info(f"{skew(bcx_mut_infos) = }")
+    hist, bins, _ = plt.hist(bcx_mut_infos, bins=50)
+    f=join_path_file(fname+'_bcx_mut_infos_hist', save_dir, ext='.png'); plt.savefig(f); generated_files.append(f)
+    return bcx_mut_infos.reshape(*orig_shape)
+
+
+def boxcox_gpu(x, lambda_val=None, eps=1e-6, sample_size=100000, device="cuda", per_column=False):
+    """
+    Apply Box-Cox transformation on GPU using PyTorch, with optional lambda estimation.
+    
+    Args:
+        x (torch.Tensor or np.ndarray): Input tensor or NumPy array (will be moved to GPU)
+        lambda_val (float, optional): Box-Cox parameter; if None, estimated from data
+        eps (float): Small value to ensure positivity (default: 1e-6)
+        sample_size (int): Size of random subsample for lambda estimation (default: 50000)
+        device (str or torch.device): Target device (default: "cuda")
+        per_column (bool): If True, estimate lambda per column; if False, global lambda (default: False)
+    
+    Returns:
+        torch.Tensor: Transformed tensor on the specified device
+    """
+    # Ensure device is a torch.device object
+    device = torch.device(device) if isinstance(device, str) else device
+    
+    # Convert NumPy array to PyTorch tensor if necessary, then move to device
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x).to(device)
+    else:
+        x = x.to(device) if x.device != device else x
+    
+    # Ensure input is strictly positive by shifting if necessary
+    min_val = x.min()
+    if min_val <= 0:
+        x_positive = x - min_val + eps  # Shift to make all values > 0
+    else:
+        x_positive = x + eps
+    
+    # Estimate lambda if not provided
+    if lambda_val is None:
+        if per_column:
+            # Estimate lambda for each column
+            n_rows, n_cols = x_positive.shape
+            sample_size = min(sample_size, n_rows)
+            if sample_size < 2:
+                raise ValueError("Sample size must be at least 2 for lambda estimation")
+            lambda_vals = torch.zeros(n_cols, device=device, dtype=x.dtype)
+            for col in tqdm(range(n_cols), desc="Estimating per-column lambda"):
+                col_data = x_positive[:, col]
+                indices = torch.randperm(n_rows, device=device)[:sample_size]
+                subsample = col_data[indices].cpu().numpy()
+                try:
+                    _, lambda_val = boxcox(subsample)
+                    lambda_vals[col] = lambda_val
+                except ValueError:
+                    lambda_vals[col] = 0.0  # Fallback to log if estimation fails
+        else:
+            # Global lambda estimation
+            flat_x = x_positive.flatten()
+            n_elements = flat_x.numel()
+            sample_size = min(sample_size, n_elements)
+            if sample_size < 2:
+                raise ValueError("Sample size must be at least 2 for lambda estimation")
+            indices = torch.randperm(n_elements, device=device)[:sample_size]
+            subsample = flat_x[indices].cpu().numpy()
+            _, lambda_val = boxcox(subsample)
+            lambda_vals = torch.tensor(lambda_val, device=device, dtype=x.dtype)
+    else:
+        lambda_vals = torch.tensor(lambda_val, device=device, dtype=x.dtype) if not isinstance(lambda_val, torch.Tensor) else lambda_val.to(device)
+    
+    # Apply Box-Cox transformation on GPU
+    if torch.is_tensor(lambda_vals) and lambda_vals.dim() > 0:  # Per-column lambda
+        out = torch.zeros_like(x_positive)
+        for colrome in tqdm(range(x_positive.shape[1]), desc="Applying per-column Box-Cox"):
+            if lambda_vals[col] == 0:
+                out[:, col] = torch.log(x_positive[:, col])
+            else:
+                out[:, col] = (x_positive[:, col].pow(lambda_vals[col]) - 1) / lambda_vals[col]
+        return out
+    else:  # Global lambda
+        if lambda_vals == 0:
+            return torch.log(x_positive)
+        else:
+            return (x_positive.pow(lambda_vals) - 1) / lambda_vals
+
+
+def stat_transform(mut_infos, save_dir, fname):
+    """
+    Apply statistical transformations to mutual information values.
+    
+    This function performs Box-Cox transformation on mutual information values
+    to correct for skewness. It also generates histograms before and after transformation.
+    
+    Args:
+        mut_infos (Tensor): Tensor containing mutual information values
+        save_dir (Path): Directory where to save histogram plots
+        fname (str): Base filename for saved plots
+        
+    Returns:
+        np.ndarray: Transformed mutual information values with original shape
+    """
+    # Initialize generated_files list if not already defined
+    if 'generated_files' not in locals():
+        generated_files = []
+        
+    # -----------------------------------------------------------------------------
+    # Initial Analysis and Preprocessing
+    # -----------------------------------------------------------------------------
+    logging.info(f"Mutual Info Shape: {mut_infos.shape}")
+    orig_shape = mut_infos.shape
+
+    # Keep as PyTorch tensor and maintain original shape
+    logging.info(
+        f"Raw Mutual Info Stats: Min={torch.min(mut_infos):.8f}, "
+        f"Max={torch.max(mut_infos):.8f}, "
+        f"Mean={torch.mean(mut_infos):.8f}"
+    )
+
+    # For skewness in PyTorch without flattening
+    # Skewness = E[(X-μ)³]/σ³
+    mean = torch.mean(mut_infos)
+    std = torch.std(mut_infos)
+    skewness = torch.mean(((mut_infos - mean) / std) ** 3) if std > 0 else torch.tensor(0.0)
+    logging.info(f"Distribution Skewness: {skewness:.6f}")
+
+    logging.info(
+        "The mutual-info values are incredibly skewed. So we need to apply some transformation. "
+        "Sometimes `mut_infos` might contain negatives, we need to convert those to epsilon."
+    )
+
+    # Handle negative values while preserving shape
+    where_negs = mut_infos < 0
+    neg_count = torch.sum(where_negs).item()
+    logging.info(f"Negative Values Count: {neg_count}")
+
+    logging.info("Converting the negative values to epsilon...")
+    eps = torch.tensor(1e-20, dtype=mut_infos.dtype, device=mut_infos.device)
+    mut_infos = torch.where(mut_infos < 0, eps, mut_infos)
+    assert torch.sum(mut_infos < 0).item() == 0
+
+    logging.info(
+        f"After Fixing Negatives: Min={torch.min(mut_infos):.8e}, "
+        f"Max={torch.max(mut_infos):.8e}, "
+        f"Mean={torch.mean(mut_infos):.8e}"
+    )
+    
+    # -----------------------------------------------------------------------------
+    # Original Distribution Histogram
+    # -----------------------------------------------------------------------------
+    plt.figure(figsize=(10, 6))
+
+    # Calculate histogram with PyTorch while preserving dimensionality
+    hist_values, bin_edges = torch.histogram(mut_infos, bins=50)
+
+    # Plot the histogram using bar plot
+    plt.bar(
+        bin_edges[:-1].cpu().numpy(), 
+        hist_values.cpu().numpy(), 
+        width=(bin_edges[1] - bin_edges[0]).item(),
+        align='edge'
+    )
+    plt.title('Mutual Information Distribution (Original)')
+    plt.xlabel('Mutual Information Value')
+    plt.ylabel('Frequency')
+
+    # Save original histogram
+    orig_hist_file = join_path_file(fname + '_mut_infos_hist', save_dir, ext='.png')
+    logging.info(f"Saving original distribution histogram to {orig_hist_file}...")
+    plt.savefig(orig_hist_file)
+    logging.info(f"Successfully saved original distribution histogram to {orig_hist_file}")
+    generated_files.append((orig_hist_file, "Histogram of original mutual information distribution"))
+    plt.close()
+
+    # -----------------------------------------------------------------------------
+    # Box-Cox Transformation
+    # -----------------------------------------------------------------------------
+    logging.info("Applying Box-Cox transformation...")
+    # Timing setup
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    # bcx_mut_infos = boxcox_gpu(mut_infos, device="cuda", per_column=True, sample_size=100000)
+    bcx_mut_infos_np, _ = boxcox(mut_infos.cpu().numpy().reshape(-1) + eps.numpy())
+    bcx_mut_infos_np = bcx_mut_infos_np.reshape(*orig_shape)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    logging.info(f"boxcox_gpu took {elapsed_time_ms / 60000:.2f} minutes")
+
+    # Check skewness after boxcox transformation
+    skewness = skew(bcx_mut_infos_np.flatten(), bias=True)
+    logging.info(f"Skewness after boxcox transformation: {skewness:.4f}")
+    
+    # Log statistics about transformed values
+    logging.info(
+        f"BCX Mutual Info Stats: Min={np.min(bcx_mut_infos_np):.6f}, "
+        f"Max={np.max(bcx_mut_infos_np):.6f}, "
+        f"Mean={np.mean(bcx_mut_infos_np):.6f}, "
+        f"Median={np.median(bcx_mut_infos_np):.6f}"
+    )
+
+    logging.info(
+        f"BCX Mutual Info Issues: NaN Count={np.isnan(bcx_mut_infos_np).sum()}, "
+        f"Inf Count={np.isinf(bcx_mut_infos_np).sum()}, "
+        f"Neg Inf Count={np.isneginf(bcx_mut_infos_np).sum()}"
+    )
+    
+    # -----------------------------------------------------------------------------
+    # Transformed Distribution Histogram
+    # -----------------------------------------------------------------------------
+    plt.figure(figsize=(10, 6))
+
+    # Calculate histogram with PyTorch while preserving dimensionality
+    hist_values, bin_edges = np.histogram(bcx_mut_infos_np, bins=50)
+
+    # Plot the histogram using bar plot
+    plt.bar(
+        bin_edges[:-1], 
+        hist_values, 
+        width=bin_edges[1] - bin_edges[0],
+        align='edge'
+    )
+    plt.title('Mutual Information Distribution (Box-Cox Transformed)')
+    plt.xlabel('Transformed Mutual Information Value')
+    plt.ylabel('Frequency')
+
+    # Save transformed histogram
+    transformed_hist_file = join_path_file(fname + '_bcx_mut_infos_hist', save_dir, ext='.png')
+    logging.info(f"Saving transformed distribution histogram to {transformed_hist_file}...")
+    plt.savefig(transformed_hist_file)
+    logging.info(f"Successfully saved transformed distribution histogram to {transformed_hist_file}")
+    generated_files.append((transformed_hist_file, "Histogram of Box-Cox transformed mutual information distribution"))
+    plt.close()
+    
+    # Return transformed values with original shape
+    # return bcx_mut_infos_np.reshape(*orig_shape)
+    return bcx_mut_infos_np
+
+
+def load_mlb_classes(mlb_dir):
+    """Load mlb classes for the labels. Uses these predefined classes in MultiLabel Binarization"""
+    labels_file = os.path.join(mlb_dir, "labels_partition.json")
+    logging.info(f"Loading MLB classes from {labels_file}")
+    with open(labels_file, "r") as f:
+        labels_partition = json.load(f)
+    
+    mlb_classes = labels_partition["classes"]
+    
+    return mlb_classes
+
+
+def sanity_check(dataset, tokenizer, mlb_classes, label_delim=None, num_samples=5):
+    """
+    Perform sanity checks on the processed dataset.
+    
+    Args:
+        dataset: Processed Dataset object from onehotify
+        tokenizer: Hugging Face tokenizer used in onehotify
+        mlb_classes: List of predefined label classes
+        label_delim: Delimiter used for splitting labels (default: None)
+        num_samples: Number of samples to check (default: 5)
+    
+    Returns:
+        None (prints results of sanity checks)
+    """
+    # Ensure we don't check more samples than available
+    num_samples = min(num_samples, len(dataset))
+    
+    logging.info(f"Performing sanity check on {num_samples} samples...\n")
+    
+    for i in range(num_samples):
+        sample = dataset[i]
+        
+        # Extract data
+        input_ids = torch.tensor(sample['input_ids'])
+        attention_mask = torch.tensor(sample['attention_mask'])
+        one_hot_labels = torch.tensor(sample['one_hot_labels'])
+        original_labels = sample['labels']  # Original string from the dataset
+        
+        # Check 1: Tokenization and decoding (truncate to 500 chars)
+        decoded_text = tokenizer.decode(input_ids, skip_special_tokens=True)[:500]
+        original_text = dataset[i]['text'][:500]
+        print(f"Sample {i} - Decoded text (first 500 chars): {decoded_text}")
+        print(f"Sample {i} - Original text (first 500 chars): {original_text}")
+        
+        # Check 2: One-hot labels vs original labels
+        # Get indices where one_hot_labels is 1
+        predicted_label_indices = torch.where(one_hot_labels == 1)[0]
+        predicted_labels = [mlb_classes[idx] for idx in predicted_label_indices.tolist()]
+        
+        # Get original labels as a list
+        if label_delim:
+            original_label_list = original_labels.split(label_delim)
+        else:
+            original_label_list = [original_labels]
+        
+        logging.info(f"Sample {i} - Predicted labels from one-hot: {predicted_labels}")
+        logging.info(f"Sample {i} - Original labels: {original_label_list}")
+        
+        # Verify that predicted labels match original labels
+        labels_match = set(predicted_labels) == set(original_label_list)
+        logging.info(f"Sample {i} - Labels match: {labels_match}")
+        logging.info("-" * 50)
+
+
+def transform_mutual_info(l2r_bootstrap, toks, lbs, output_dir, fname):
+    """
+    Retrieve and transform mutual information data into a PyTorch tensor.
+    
+    Args:
+        l2r_bootstrap (dict): Dictionary containing mutual information data (key: 'mutual_info_jaccard').
+        toks (list): List of tokens.
+        lbs (list): List of labels.
+        output_dir (str): Directory path for saving/loading transformed data.
+        fname (str): Filename for saving/loading transformed data.
+    
+    Returns:
+        torch.Tensor: Transformed mutual information scores as a PyTorch tensor on the default device.
+    """
+    # Retrieve mutual information data and validate shape
+    info = l2r_bootstrap.get('mutual_info_jaccard', None)
+    assert info.shape == (len(toks), len(lbs)), \
+        f"Expected info shape {(len(toks), len(lbs))}, got {info.shape}"
+    
+    # Transform data and convert to PyTorch tensor
+    bcx_mut_infos = torch.from_numpy(stat_transform(info, Path(output_dir), fname)).to(default_device())
+    
+    return bcx_mut_infos
+
+
+def compute_token_label_ranks(bcx_mut_infos, toks, lbs):
+    """
+    Compute mutual information scores and ranks for tokens per label, and store in a DataFrame.
+    
+    Args:
+        bcx_mut_infos (torch.Tensor): Transformed mutual information scores as a PyTorch tensor on the default device.
+        toks (list): List of tokens.
+        lbs (list): List of labels.
+        output_dir (str): Directory path for saving/loading transformed data.
+        fname (str): Filename for saving/loading transformed data.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['token', 'label', 'bcx_mutual_info', 'rank'],
+                      where each row represents a token-label pair with its mutual information
+                      score and rank of the token for that specific label.
+    """
+    # Compute ranks of tokens for each label
+    ranked = bcx_mut_infos.argsort(descending=True, dim=0).argsort(dim=0)
+    
+    # Stack mutual info and ranks, then flatten
+    info_ranked = torch.stack((bcx_mut_infos, ranked), dim=2).flatten(start_dim=1)
+    
+    # Create MultiIndex for DataFrame columns
+    cols = pd.MultiIndex.from_product(
+        [range(len(lbs)), ['bcx_mutual_info', 'rank']],
+        names=['label', 'key2']
+    )
+    
+    # Create DataFrame
+    df_token_per_label_scores_ranks = pd.DataFrame(info_ranked, index=range(len(toks)), columns=cols)
+    df_token_per_label_scores_ranks.index.name = 'token'
+    
+    # Reshape to long format
+    df_token_per_label_scores_ranks = df_token_per_label_scores_ranks.stack(level=0).reset_index().rename_axis(None, axis=1)
+    
+    # Convert token and label columns to int32
+    df_token_per_label_scores_ranks[['token', 'label']] = df_token_per_label_scores_ranks[['token', 'label']].astype(np.int32)
+    
+    # Validate DataFrame length
+    assert len(df_token_per_label_scores_ranks) == len(toks) * len(lbs), \
+        f"Expected len(df_token_per_label_scores_ranks) {len(toks) * len(lbs)}, got {len(df_token_per_label_scores_ranks)}"
+    
+    return df_token_per_label_scores_ranks
+
+
+def compute_label_token_ranks(bcx_mut_infos, toks, lbs):
+    """
+    Compute mutual information scores and ranks for labels per token, and store in a DataFrame.
+    
+    Args:
+        bcx_mut_infos (torch.Tensor): Transformed mutual information scores as a PyTorch tensor on the default device.
+        toks (list): List of tokens.
+        lbs (list): List of labels.
+        output_dir (str): Directory path for saving/loading transformed data.
+        fname (str): Filename for saving/loading transformed data.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['token', 'label', 'bcx_mutual_info', 'rank'],
+                      where each row represents a token-label pair with its mutual information
+                      score and rank of the label for that specific token.
+    """
+    # Compute ranks of labels for each token
+    ranked = bcx_mut_infos.argsort(descending=True, dim=1).argsort(dim=1)
+    
+    # Stack mutual info and ranks, then flatten
+    info_ranked = torch.stack((bcx_mut_infos, ranked), dim=2).flatten(start_dim=1)
+    
+    # Create MultiIndex for DataFrame columns
+    cols = pd.MultiIndex.from_product(
+        [range(len(lbs)), ['bcx_mutual_info', 'rank']],
+        names=['label', 'key2']
+    )
+    
+    # Create DataFrame
+    df_label_per_token_scores_ranks = pd.DataFrame(info_ranked, index=range(len(toks)), columns=cols)
+    df_label_per_token_scores_ranks.index.name = 'token'
+    
+    # Reshape to long format
+    df_label_per_token_scores_ranks = df_label_per_token_scores_ranks.stack(level=0).reset_index().rename_axis(None, axis=1)
+    
+    # Convert token and label columns to int32
+    df_label_per_token_scores_ranks[['token', 'label']] = df_label_per_token_scores_ranks[['token', 'label']].astype(np.int32)
+    
+    # Validate DataFrame length
+    assert len(df_label_per_token_scores_ranks) == len(toks) * len(lbs), \
+        f"Expected len(df_label_per_token_scores_ranks) {len(toks) * len(lbs)}, got {len(df_label_per_token_scores_ranks)}"
+    
+    return df_label_per_token_scores_ranks
+    
+
+# =============================================================================
+# First Main Function - Data Processing and Information Calculation
+# =============================================================================
+def main_preprocessing(
+    output_dir: str,
+    fname: str,
+    toks,
+    lbs,
+    label_delim: str = ";",
+    workers: int = None,
+    bs: int = 16,
+    chnk_sz: int = 200,
+    info=None,
+    dsets=None
+):
+    """
+    Bootstrapping a learning-to-rank model - Part 1: Preprocessing and Information Calculation
+    """
+    global generated_files
+    generated_files = []
+    
+    logging.info("\nOnehotifying the text and labels...")
+    logging.info(f"Number of Tokens = {len(toks)}, Number of labels = {len(lbs)}")
+    sanity_check(dsets, info.tokenizer, info.mlb_classes, label_delim=label_delim, num_samples=2)
+
+    # -----------------------------------------------------------------------------
+    # Data Chunking and PMF Computation
+    # -----------------------------------------------------------------------------
+    logging.info(f"chunking the labels into {info.lblsize/chnk_sz} many chunks, each chunk has {chnk_sz} many labels.")
+    dls = info.create_chunked_dataloaders()
+    info.sanity_check_chunked()
+
+    logging.info(f"Computing joint pmf by batching {len(dsets)} datapoints into batches of size {bs} "
+                 f"(so total {len(dsets)/bs} mini-batches). Also each mini-batch only has a chunk of the "
+                 f"{chnk_sz} lbs (and we have {info.lblsize/chnk_sz} many dataloders).")
+    
+    # Load or compute joint probability mass function
+    joint_pmf_file = join_path_file(fname + '_p_TL', Path(output_dir), ext='.pkl')
+    if joint_pmf_file.exists():
+        logging.info(f"Found {joint_pmf_file}. Loading it now...")
+        p_TL = torch.load(joint_pmf_file)
+    else:
+        p_TL = info.joint_pmf()
+    # Uncomment to save joint PMF
+    # if not joint_pmf_file.exists():
+    #     logging.info(f"Saving joint probability mass function to {joint_pmf_file}...")
+    #     torch.save(p_TL, joint_pmf_file)
+    #     logging.info(f"Successfully saved joint probability mass function to {joint_pmf_file}")
+    #     generated_files.append((joint_pmf_file, "Joint probability mass function between tokens and labels"))
+    
+    assert p_TL.shape == (info.toksize, info.lblsize, 2, 2), \
+        f"Expected p_TL shape {(info.toksize, info.lblsize, 2, 2)}, got {p_TL.shape}"
+    
+    # Load or compute other information metrics
+    info_pkl_file = join_path_file(fname + '_info', Path(output_dir), ext='.pkl')
+    if info_pkl_file.exists():
+        logging.info(f"Found {info_pkl_file}. Loading it...")
+        p_T, p_L, p_TxL, H_T, H_L, I_TL = torch.load(info_pkl_file)
+    else:
+        p_T, p_L, p_TxL, H_T, H_L, I_TL = info.compute()
+    # Uncomment to save info metrics
+    # if not info_pkl_file.exists():
+    #     logging.info(f"Saving information metrics to {info_pkl_file}...")
+    #     torch.save((p_T, p_L, p_TxL, H_T, H_L, I_TL), info_pkl_file)
+    #     logging.info(f"Successfully saved information metrics to {info_pkl_file}")
+    #     generated_files.append((info_pkl_file, "Information-theoretic metrics (token/label probabilities, entropy, mutual information)"))
+    
+    # Validate tensor shapes
+    assert p_TL.shape == (info.toksize, info.lblsize, 2, 2), \
+        f"Expected p_TL shape {(info.toksize, info.lblsize, 2, 2)}, got {p_TL.shape}"
+    assert p_T.shape == (info.toksize, 2, 1), \
+        f"Expected p_T shape {(info.toksize, 2, 1)}, got {p_T.shape}"
+    assert p_L.shape == (info.lblsize, 1, 2), \
+        f"Expected p_L shape {(info.lblsize, 1, 2)}, got {p_L.shape}"
+    assert p_TxL.shape == (info.toksize, info.lblsize, 2, 2), \
+        f"Expected p_TxL shape {(info.toksize, info.lblsize, 2, 2)}, got {p_TxL.shape}"
+    assert H_T.shape == torch.Size([info.toksize]), \
+        f"Expected H_T shape {[info.toksize]}, got {H_T.shape}"
+    assert H_L.shape == torch.Size([info.lblsize]), \
+        f"Expected H_L shape {[info.lblsize]}, got {H_L.shape}"
+    assert I_TL.shape == (info.toksize, info.lblsize), \
+        f"Expected I_TL shape {(info.toksize, info.lblsize)}, got {I_TL.shape}"
+    
+    logging.info("Done computing joint pmf!")
+
+    # -----------------------------------------------------------------------------
+    # Data Validation
+    # -----------------------------------------------------------------------------
+    logging.info("Checking for nans/negs...")
+    for k, v in dict(p_T=p_T, p_L=p_L, p_TxL=p_TxL, H_T=H_T, H_L=H_L, I_TL=I_TL).items():
+        howmany = torch.where(v < 0, True, False).sum().item()
+        negs = torch.where(v < 0, v, v.new_zeros(v.shape))
+        logging.info(f'Checking nans/negs in {k}...')
+        
+        if howmany:
+            logging.warning(f"Avg value of negs: {negs.sum()/howmany}")
+            logging.warning("Those negs on an avg are pretty close to zero. So we need not worry. Let's roll!")
+            test_fail(test_nanegs, kwargs={k: v}, contains=f'{k} has negs')
+            torch.topk(v.flatten(), 10, largest=False)
+        else:
+            logging.info(f"{k} does not have any negs. Let's move on!")
+        
+        logging.info("*" * 50)
+
+    # -----------------------------------------------------------------------------
+    # Save Results
+    # -----------------------------------------------------------------------------
+    label_prob_file = join_path_file(fname + '_p_L', Path(output_dir), ext='.pkl')
+    logging.info(f"Saving label probabilities to {label_prob_file}...")
+    torch.save(p_L, label_prob_file)
+    logging.info(f"Successfully saved label probabilities to {label_prob_file}")
+    generated_files.append((label_prob_file, "Label probabilities tensor used for ranking calculation"))
+    
+    # Calculate metrics
+    eps = I_TL.new_empty(1).fill_(1e-15)
+    info_lbl_entropy = I_TL / (H_L + eps)
+    info_jaccard = I_TL / (H_T.unsqueeze(-1) + H_L.unsqueeze(0) - I_TL + eps)
+    
+    assert not info_lbl_entropy.isnan().all()
+    assert not info_jaccard.isnan().all()
+    
+    l2r_bootstrap = {
+        'toks': toks,
+        'lbs': lbs,
+        'mut_info_lbl_entropy': info_lbl_entropy,
+        'mutual_info_jaccard': info_jaccard
+    }
+    
+    token_label_info_file = join_path_file(fname + '_tok_lbl_info', Path(output_dir), ext='.pkl')
+    logging.info(f"Saving token-label information to {token_label_info_file}...")
+    torch.save(l2r_bootstrap, token_label_info_file)
+    logging.info(f"Successfully saved token-label information to {token_label_info_file}")
+    generated_files.append((token_label_info_file, "Dictionary containing tokens, labels, and mutual information metrics"))
+
+    # Print summary of generated files with descriptions
+    print("\n" + "="*80)
+    print("GENERATED FILES SUMMARY (PREPROCESSING)")
+    print("="*80)
+    for file_path, description in generated_files:
+        file_name = os.path.basename(file_path)
+        file_ext = os.path.splitext(file_name)[1]
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        
+        # Format file size for human readability
+        if file_size < 1024:
+            size_str = f"{file_size} bytes"
+        elif file_size < 1024*1024:
+            size_str = f"{file_size/1024:.2f} KB"
+        else:
+            size_str = f"{file_size/(1024*1024):.2f} MB"
+            
+        print(f"File: {file_path}")
+        print(f"  - Type: {file_ext[1:].upper()} file")
+        print(f"  - Size: {size_str}")
+        print(f"  - Description: {description}")
+        print("-"*80)
+
+
+# =============================================================================
+# Second Main Function - Final Processing and Output
+# =============================================================================
+def main_processing_output(
+    output_dir: str,
+    fname: str,
+    toks,
+    lbs
+):
+    """
+    Bootstrapping a learning-to-rank model - Part 2: Final Processing and Output Generation
+    """
+    global generated_files
+    generated_files = []
+    
+    # -----------------------------------------------------------------------------
+    # Final Processing and Output
+    # -----------------------------------------------------------------------------
+    # Load and process the token-label information
+    token_label_info_path = join_path_file(fname + '_tok_lbl_info', Path(output_dir), ext='.pkl')
+    l2r_bootstrap = torch.load(
+        token_label_info_path,
+        map_location=torch.device('cpu')
+    )
+    
+    # info = l2r_bootstrap.get('mutual_info_jaccard', None)
+    # assert info.shape == (len(toks), len(lbs)), \
+    #     f"Expected info shape {(len(toks), len(lbs))}, got {info.shape}"
+    
+    # bcx_mut_infos = torch.from_numpy(stat_transform(info, Path(output_dir), fname)).to(default_device())
+    # ranked = bcx_mut_infos.argsort(descending=True, dim=0).argsort(dim=0)
+    # info_ranked = torch.stack((bcx_mut_infos, ranked), dim=2).flatten(start_dim=1)
+    
+    # cols = pd.MultiIndex.from_product(
+    #     [range(len(lbs)), ['bcx_mutual_info', 'rank']],
+    #     names=['label', 'key2']
+    # )
+    
+    # df_l2r = pd.DataFrame(info_ranked, index=range(len(toks)), columns=cols)
+    # df_l2r.index.name = 'token'
+    # df_l2r = df_l2r.stack(level=0).reset_index().rename_axis(None, axis=1)
+    # df_l2r[['token', 'label']] = df_l2r[['token', 'label']].astype(np.int32)
+    
+    # assert len(df_l2r) == len(toks) * len(lbs), \
+    #     f"Expected len(df_l2r) {len(toks) * len(lbs)}, got {len(df_l2r)}"
+
+    # Retrieve and transform mutual information data
+    bcx_mut_infos = transform_mutual_info(l2r_bootstrap, toks, lbs, output_dir, fname)
+    
+    # Compute ranks of tokens for each label
+    df_token_per_label_scores_ranks = compute_token_label_ranks(bcx_mut_infos, toks, lbs)
+
+    # Compute ranks of labels for each token
+    df_label_per_token_scores_ranks = compute_label_token_ranks(bcx_mut_infos, toks, lbs)
+
+    
+    # Create token and label DataFrames
+    df_toks = pd.DataFrame([(i, w) for i, w in enumerate(toks)], columns=['token', 'tok_val'])
+    df_lbs = pd.DataFrame([(i, w) for i, w in enumerate(lbs)], columns=['lbl', 'lbl_val'])
+    
+    # Save files
+    tokens_file = join_path_file(fname + '_tok', Path(output_dir), ext='.ft')
+    logging.info(f"Saving token mappings to {tokens_file}...")
+    df_toks.to_feather(tokens_file)
+    logging.info(f"Successfully saved token mappings to {tokens_file}")
+    generated_files.append((tokens_file, "DataFrame mapping token IDs to their string values"))
+    
+    labels_file = join_path_file(fname + '_lbl', Path(output_dir), ext='.ft')
+    logging.info(f"Saving label mappings to {labels_file}...")
+    df_lbs.to_feather(labels_file)
+    logging.info(f"Successfully saved label mappings to {labels_file}")
+    generated_files.append((labels_file, "DataFrame mapping label IDs to their string values"))
+    
+    token_per_label_rankings_file = join_path_file(fname + '_tok_rank_per_lbl', Path(output_dir), ext='.ft')
+    logging.info(f"Saving rankings of tokens per label to {token_per_label_rankings_file}...")
+    df_token_per_label_scores_ranks.to_feather(token_per_label_rankings_file)
+    logging.info(f"Successfully saved rankings of tokens per label to {token_per_label_rankings_file}")
+    generated_files.append((token_per_label_rankings_file, 
+                        """ 
+                            DataFrame with columns ['token', 'label', 'bcx_mutual_info', 'rank'],
+                            where each row represents a token-label pair with its mutual information
+                            score and rank of the token for that specific label.
+                        """))
+
+    label_per_token_rankings_file = join_path_file(fname + '_lbl_rank_per_tok', Path(output_dir), ext='.ft')
+    logging.info(f"Saving rankings of labels per token to {label_per_token_rankings_file}...")
+    df_label_per_token_scores_ranks.to_feather(label_per_token_rankings_file)
+    logging.info(f"Successfully saved rankings of labels per token to {label_per_token_rankings_file}")
+    generated_files.append((label_per_token_rankings_file, 
+                        """ 
+                            DataFrame with columns ['token', 'label', 'bcx_mutual_info', 'rank'],
+                            where each row represents a token-label pair with its mutual information
+                            score and rank of the label for that specific token.
+                        """))
+
+    # Print summary of generated files with descriptions
+    print("\n" + "="*80)
+    print("GENERATED FILES SUMMARY (PROCESSING OUTPUT)")
+    print("="*80)
+    for file_path, description in generated_files:
+        file_name = os.path.basename(file_path)
+        file_ext = os.path.splitext(file_name)[1]
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        
+        # Format file size for human readability
+        if file_size < 1024:
+            size_str = f"{file_size} bytes"
+        elif file_size < 1024*1024:
+            size_str = f"{file_size/1024:.2f} KB"
+        else:
+            size_str = f"{file_size/(1024*1024):.2f} MB"
+            
+        print(f"File: {file_path}")
+        print(f"  - Type: {file_ext[1:].upper()} file")
+        print(f"  - Size: {size_str}")
+        print(f"  - Description: {description}")
+        print("-"*80)
+
+
+# =============================================================================
+# Unified Main Function that Calls Both Parts
+# =============================================================================
+def main(
+    output_dir: str = "task2_output",
+    source_url: str = "XURLs.MIMIC4_L2R",
+    data: str = "mimic4_icd10_full",
+    label_delim: str = ";",
+    root_dir: str = "..",
+    base_dir: str = None,
+    workers: int = None,
+    bs: int = 16,
+    max_length: int = 512,
+    chnk_sz: int = 200,
+    logfile: str = "l2rboot",
+    hub_model_id: str = "deb101/mistral-7b-mimic4",  # Task 1 Domain Adaptation model
+):
+    """
+    Bootstrapping a learning-to-rank model (unified function that calls both parts)
+    """
+    # -----------------------------------------------------------------------------
+    # Data and File Setup
+    # -----------------------------------------------------------------------------
+    source = rank0_first(untar_xxx, eval(source_url))
+    fname = '_'.join(data.split('_')[:-1])
+    base_dir = base_dir + '/' + source_url.split('.')[1]
+    output_dir = str(Path(base_dir) / output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Setup logger and print arguments
+    logfile_path = setup_logging(**locals())
+    print(f"You can tail the logfile: {logfile_path} to check logs")
+    print_args(**locals())
+
+    logging.info("****L2R Bootstraping for Multi-Label Classification Started****")
+
+    # Hardcode your HF token (or load from environment variable)
+    # hf_token = "your_hf_token_here"  # Replace or use os.environ["HF_TOKEN"]
+    hf_token = os.environ["HF_TOKEN"]
+
+    # -----------------------------------------------------------------------------
+    # Information Object Setup
+    # -----------------------------------------------------------------------------
+    info = get_info(source, data, hub_model_id, base_dir, hf_token, bs=bs, chnk_sz=chnk_sz, workers=None)
+    
+    info_file = join_path_file(fname + '_info_obj', Path(output_dir), ext='.pkl')
+    if info_file.exists():
+        logging.info(f'Info object found in {output_dir}. Loading it...')
+        info = torch.load(info_file)
+        dsets = getattr(info, 'dsets', None)
+    else:
+        dsets = info.onehotify(max_length=max_length, label_delim=label_delim, overlap=10)
+    # Uncomment to save info object
+    # if not info_file.exists():
+    #     logging.info(f"Saving info object to {info_file}...")
+    #     torch.save(info, info_file)
+    #     logging.info(f"Successfully saved info object to {info_file}")
+    #     generated_files.append((info_file, "Information object containing tokenizer, dataset, and preprocessing details"))
+    
+    toks = info.tokenizer.convert_ids_to_tokens(range(len(info.tokenizer))) 
+    lbs = info.mlb_classes
+    
+    # Run preprocessing step
+    main_preprocessing(
+        output_dir=output_dir,
+        fname=fname,
+        toks=toks,
+        lbs=lbs,
+        label_delim=label_delim,
+        workers=workers,
+        bs=bs,
+        chnk_sz=chnk_sz,
+        info=info,
+        dsets=dsets
+    )
+    
+    # Run final processing and output generation
+    main_processing_output(output_dir, fname, toks, lbs)
+
+
+if __name__ == "__main__":
+    # Parse arguments
+    args = parse_args()
+    # Convert the Namespace to a dictionary and pass to main via dictionary unpacking.
+    main(**vars(args))

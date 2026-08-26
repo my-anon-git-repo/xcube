@@ -1,0 +1,2 @@
+*.ipynb merge=nbdev-merge
+DEVELOPMENT_WORKFLOW.md export-ignore
